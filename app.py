@@ -1,5 +1,5 @@
 import streamlit as st
-from content_based_filtering import content_recommendation
+from content_based_filtering import content_recommendation, train_transformer, transform_data
 from scipy.sparse import load_npz
 import pandas as pd
 from numpy import load
@@ -8,6 +8,7 @@ from pathlib import Path
 import json
 import requests
 import os
+from data_cleaning import data_for_content_filtering
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -42,6 +43,18 @@ def _try_download_if_missing(path: Path) -> bool:
     if not url:
         return False
 
+    # Protect against placeholder/example URLs in data_urls.json
+    if "example.com" in url or url.strip().upper() in ("PLACEHOLDER", "TBD", "TODO"):
+        st.warning(f"Found placeholder download URL for `{key}` in data/data_urls.json; skipping download.")
+        return False
+
+    # If repository on deploy contains .dvc placeholders or Git LFS pointers,
+    # avoid futile download attempts and surface clear guidance instead.
+    if DATA_DIR.exists() and any(p.name.endswith('.dvc') for p in DATA_DIR.iterdir()):
+        st.warning("Detected .dvc placeholder files in `data/` — raw data objects were not included in the repo on deploy.")
+        st.write("Either enable Git LFS for your deployment (Streamlit Cloud supports Git LFS), or host the raw data externally and add real URLs to `data/data_urls.json`.")
+        return False
+
     try:
         st.info(f"Attempting to download `{key}` from provided URL...")
         # Ensure data dir exists
@@ -59,6 +72,24 @@ def _try_download_if_missing(path: Path) -> bool:
         return False
 
 def _read_csv_rel(path: Path):
+    # If file exists, ensure it's not a Git LFS pointer (pointer files are small text files)
+    if path.exists():
+        try:
+            first_line = path.open('r', encoding='utf-8', errors='ignore').readline()
+            if first_line.strip().startswith('version https://git-lfs.github.com/spec/v1'):
+                st.error("A Git LFS pointer file was found for: " + str(path.name))
+                st.write("This indicates the LFS object was not downloaded during deploy."
+                         " Ensure your deployment source pulls Git LFS objects (Streamlit Cloud supports Git LFS),"
+                         " or provide a direct download URL in `data/data_urls.json`.")
+                st.write("Helpful steps:")
+                st.write("- Confirm the Streamlit app is connected to the correct GitHub repo and branch.")
+                st.write("- Re-deploy the app and choose 'Clear cache and redeploy' in Streamlit Cloud.")
+                st.write("- Alternatively, host the data externally and add URLs to `data/data_urls.json`.")
+                st.stop()
+        except Exception:
+            # if reading fails, fall through and let pandas raise a useful error
+            pass
+
     try:
         return pd.read_csv(path)
     except FileNotFoundError:
@@ -85,27 +116,65 @@ def _np_load_rel(path: Path, **kwargs):
 
 # load the data (paths resolved relative to this file)
 cleaned_data_path = DATA_DIR / "cleaned_data.csv"
-songs_data = _read_csv_rel(cleaned_data_path)
+# prefer the full data; if missing on deploy, fall back to a small sample included in the repo
+sample_cleaned = DATA_DIR / "cleaned_data_sample.csv"
+if cleaned_data_path.exists():
+    songs_data = _read_csv_rel(cleaned_data_path)
+elif sample_cleaned.exists():
+    st.warning("Full dataset not found — using bundled small sample for deployment.")
+    songs_data = pd.read_csv(sample_cleaned)
+else:
+    songs_data = _read_csv_rel(cleaned_data_path)
 
-# load the transformed data
+# load or compute the transformed data (content-based)
 transformed_data_path = DATA_DIR / "transformed_data.npz"
-transformed_data = _load_npz_rel(transformed_data_path)
+if transformed_data_path.exists():
+    transformed_data = load_npz(transformed_data_path)
+else:
+    # Compute on the fly from available songs_data (works with sample too)
+    try:
+        st.warning("transformed_data.npz not found — computing content features on the fly (demo mode).")
+        df_cf = data_for_content_filtering(songs_data.copy())
+        # train transformer and transform data
+        train_transformer(df_cf)
+        transformed_data = transform_data(df_cf)
+    except Exception as e:
+        st.error(f"Unable to compute content features: {e}")
+        _st_list_data_dir_and_stop(transformed_data_path)
 
-# load the track ids
-track_ids_path = DATA_DIR / "track_ids.npy"
-track_ids = _np_load_rel(track_ids_path, allow_pickle=True)
+# track ids are only required for hybrid mode; load conditionally below
+track_ids = None
 
-# load the filtered songs data
+# Try to load hybrid/collaborative artifacts; if missing, disable hybrid mode gracefully
+hybrid_available = True
+
+filtered_data = None
 filtered_data_path = DATA_DIR / "collab_filtered_data.csv"
-filtered_data = _read_csv_rel(filtered_data_path)
+if filtered_data_path.exists():
+    filtered_data = _read_csv_rel(filtered_data_path)
+else:
+    hybrid_available = False
 
-# load the interaction matrix
+interaction_matrix = None
 interaction_matrix_path = DATA_DIR / "interaction_matrix.npz"
-interaction_matrix = _load_npz_rel(interaction_matrix_path)
+if interaction_matrix_path.exists():
+    interaction_matrix = load_npz(interaction_matrix_path)
+else:
+    hybrid_available = False
 
-# load the transformed hybrid data
+transformed_hybrid_data = None
 transformed_hybrid_data_path = DATA_DIR / "transformed_hybrid_data.npz"
-transformed_hybrid_data = _load_npz_rel(transformed_hybrid_data_path)
+if transformed_hybrid_data_path.exists():
+    transformed_hybrid_data = load_npz(transformed_hybrid_data_path)
+else:
+    hybrid_available = False
+
+# load track ids only if present; otherwise disable hybrid
+track_ids_path = DATA_DIR / "track_ids.npy"
+if track_ids_path.exists():
+    track_ids = _np_load_rel(track_ids_path, allow_pickle=True)
+else:
+    hybrid_available = False
 
 # Title
 st.title('Welcome to the Spotify Song Recommender!')
@@ -126,9 +195,14 @@ artist_name = artist_name.lower()
 # k recommndations
 k = st.selectbox('How many recommendations do you want?', [5,10,15,20], index=1)
 
-if ((filtered_data["name"] == song_name) & (filtered_data["artist"] == artist_name)).any():   
-    # type of filtering
-    filtering_type = "Hybrid Recommender System"
+# Determine available mode and default filtering type
+filtering_type = 'Content-Based Filtering'
+if hybrid_available and filtered_data is not None:
+    try:
+        if ((filtered_data["name"] == song_name) & (filtered_data["artist"] == artist_name)).any():
+            filtering_type = "Hybrid Recommender System"
+    except Exception:
+        filtering_type = 'Content-Based Filtering'
 
     # diversity slider
     diversity = st.slider(label="Diversity in Recommendations",
@@ -147,9 +221,8 @@ if ((filtered_data["name"] == song_name) & (filtered_data["artist"] == artist_na
     
     st.bar_chart(chart_data,x="type",y="ratio")
     
-else:
-    # type of filtering
-    filtering_type = 'Content-Based Filtering'
+if not hybrid_available:
+    st.info("Hybrid mode artifacts not found on deploy — running in content-based demo mode.")
 
 # Button
 if filtering_type == 'Content-Based Filtering':
@@ -170,21 +243,27 @@ if filtering_type == 'Content-Based Filtering':
                 if ind == 0:
                     st.markdown("## Currently Playing")
                     st.markdown(f"#### **{song_name}** by **{artist_name}**")
-                    st.audio(recommendation['spotify_preview_url'])
+                    _url = str(recommendation.get('spotify_preview_url') or '').strip()
+                    if _url and _url.lower() != 'nan':
+                        st.audio(_url)
                     st.write('---')
                 elif ind == 1:   
                     st.markdown("### Next Up 🎵")
                     st.markdown(f"#### {ind}. **{song_name}** by **{artist_name}**")
-                    st.audio(recommendation['spotify_preview_url'])
+                    _url = str(recommendation.get('spotify_preview_url') or '').strip()
+                    if _url and _url.lower() != 'nan':
+                        st.audio(_url)
                     st.write('---')
                 else:
                     st.markdown(f"#### {ind}. **{song_name}** by **{artist_name}**")
-                    st.audio(recommendation['spotify_preview_url'])
+                    _url = str(recommendation.get('spotify_preview_url') or '').strip()
+                    if _url and _url.lower() != 'nan':
+                        st.audio(_url)
                     st.write('---')
         else:
             st.write(f"Sorry, we couldn't find {song_name} in our database. Please try another song.")
             
-elif filtering_type == "Hybrid Recommender System":
+elif filtering_type == "Hybrid Recommender System" and hybrid_available:
     if st.button('Get Recommendations'):
         st.write('Recommendations for', f"**{song_name}** by **{artist_name}**")
         recommender = HybridRecommenderSystem(
@@ -194,11 +273,11 @@ elif filtering_type == "Hybrid Recommender System":
                                 
         # get the recommendations
         recommendations = recommender.give_recommendations(song_name= song_name,
-                                                        artist_name= artist_name,
-                                                        songs_data= filtered_data,
-                                                        transformed_matrix= transformed_hybrid_data,
-                                                        track_ids= track_ids,
-                                                        interaction_matrix= interaction_matrix)
+                                artist_name= artist_name,
+                                songs_data= filtered_data,
+                                transformed_matrix= transformed_hybrid_data,
+                                track_ids= track_ids,
+                                interaction_matrix= interaction_matrix)
         # Display Recommendations
         for ind , recommendation in recommendations.iterrows():
             song_name = recommendation['name'].title()
@@ -207,14 +286,22 @@ elif filtering_type == "Hybrid Recommender System":
             if ind == 0:
                 st.markdown("## Currently Playing")
                 st.markdown(f"#### **{song_name}** by **{artist_name}**")
-                st.audio(recommendation['spotify_preview_url'])
+                _url = str(recommendation.get('spotify_preview_url') or '').strip()
+                if _url and _url.lower() != 'nan':
+                    st.audio(_url)
                 st.write('---')
             elif ind == 1:   
                 st.markdown("### Next Up 🎵")
                 st.markdown(f"#### {ind}. **{song_name}** by **{artist_name}**")
-                st.audio(recommendation['spotify_preview_url'])
+                _url = str(recommendation.get('spotify_preview_url') or '').strip()
+                if _url and _url.lower() != 'nan':
+                    st.audio(_url)
                 st.write('---')
             else:
                 st.markdown(f"#### {ind}. **{song_name}** by **{artist_name}**")
-                st.audio(recommendation['spotify_preview_url'])
+                _url = str(recommendation.get('spotify_preview_url') or '').strip()
+                if _url and _url.lower() != 'nan':
+                    st.audio(_url)
                 st.write('---')
+elif filtering_type == "Hybrid Recommender System" and not hybrid_available:
+    st.warning("Hybrid recommendations are unavailable in this deployment. Please provide hybrid artifacts or use content-based mode.")
