@@ -4,8 +4,12 @@
 /data/*.joblib filter=lfs diff=lfs merge=lfs -text
 /transformer.joblib filter=lfs diff=lfs merge=lfs -text
 /data/*.csv filter=lfs diff=lfs merge=lfs -text
+data/transformed_hybrid_data.npz filter=lfs diff=lfs merge=lfs -text
+data/track_ids.npy filter=lfs diff=lfs merge=lfs -text
 data/cleaned_data.csv filter=lfs diff=lfs merge=lfs -text
 data/collab_filtered_data.csv filter=lfs diff=lfs merge=lfs -text
+data/interaction_matrix.npz filter=lfs diff=lfs merge=lfs -text
+data/transformed_data.npz filter=lfs diff=lfs merge=lfs -text
 data/*.npz filter=lfs diff=lfs merge=lfs -text
 data/*.npy filter=lfs diff=lfs merge=lfs -text
 data/*.csv filter=lfs diff=lfs merge=lfs -text
