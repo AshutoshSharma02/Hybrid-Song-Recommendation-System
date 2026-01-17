@@ -1,0 +1,8 @@
+{
+  "cleaned_data.csv": "https://example.com/path/to/cleaned_data.csv",
+  "collab_filtered_data.csv": "https://example.com/path/to/collab_filtered_data.csv",
+  "interaction_matrix.npz": "https://example.com/path/to/interaction_matrix.npz",
+  "transformed_data.npz": "https://example.com/path/to/transformed_data.npz",
+  "transformed_hybrid_data.npz": "https://example.com/path/to/transformed_hybrid_data.npz",
+  "track_ids.npy": "https://example.com/path/to/track_ids.npy"
+}

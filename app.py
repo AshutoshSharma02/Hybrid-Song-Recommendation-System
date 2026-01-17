@@ -4,31 +4,108 @@ from scipy.sparse import load_npz
 import pandas as pd
 from numpy import load
 from hybrid_recommendations import HybridRecommenderSystem
+from pathlib import Path
+import json
+import requests
+import os
 
 
-# load the data
-cleaned_data_path = "data/cleaned_data.csv"
-songs_data = pd.read_csv(cleaned_data_path)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+
+def _st_list_data_dir_and_stop(missing_path: Path):
+    st.error(f"Data file not found: {missing_path}")
+    st.write("Looking for data files in:", str(DATA_DIR))
+    if DATA_DIR.exists() and DATA_DIR.is_dir():
+        st.write("Files in `data/`:")
+        for p in sorted(DATA_DIR.iterdir()):
+            st.write("-", p.name)
+    else:
+        st.write("No `data/` directory found at", str(DATA_DIR))
+    st.stop()
+
+def _try_download_if_missing(path: Path) -> bool:
+    """If a data_urls.json mapping exists, try to download the missing file.
+    Returns True if file was downloaded successfully, False otherwise.
+    """
+    urls_file = DATA_DIR / "data_urls.json"
+    if not urls_file.exists():
+        return False
+
+    try:
+        mapping = json.loads(urls_file.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    key = path.name
+    url = mapping.get(key) or mapping.get(str(path))
+    if not url:
+        return False
+
+    try:
+        st.info(f"Attempting to download `{key}` from provided URL...")
+        # Ensure data dir exists
+        os.makedirs(path.parent, exist_ok=True)
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        st.success(f"Downloaded {key} to {path}")
+        return True
+    except Exception as e:
+        st.warning(f"Failed to download {key}: {e}")
+        return False
+
+def _read_csv_rel(path: Path):
+    try:
+        return pd.read_csv(path)
+    except FileNotFoundError:
+        # try to download if URL mapping provided, then retry
+        if _try_download_if_missing(path):
+            return pd.read_csv(path)
+        _st_list_data_dir_and_stop(path)
+
+def _load_npz_rel(path: Path):
+    try:
+        return load_npz(path)
+    except FileNotFoundError:
+        if _try_download_if_missing(path):
+            return load_npz(path)
+        _st_list_data_dir_and_stop(path)
+
+def _np_load_rel(path: Path, **kwargs):
+    try:
+        return load(path, **kwargs)
+    except FileNotFoundError:
+        if _try_download_if_missing(path):
+            return load(path, **kwargs)
+        _st_list_data_dir_and_stop(path)
+
+# load the data (paths resolved relative to this file)
+cleaned_data_path = DATA_DIR / "cleaned_data.csv"
+songs_data = _read_csv_rel(cleaned_data_path)
 
 # load the transformed data
-transformed_data_path = "data/transformed_data.npz"
-transformed_data = load_npz(transformed_data_path)
+transformed_data_path = DATA_DIR / "transformed_data.npz"
+transformed_data = _load_npz_rel(transformed_data_path)
 
 # load the track ids
-track_ids_path = "data/track_ids.npy"
-track_ids = load(track_ids_path,allow_pickle=True)
+track_ids_path = DATA_DIR / "track_ids.npy"
+track_ids = _np_load_rel(track_ids_path, allow_pickle=True)
 
 # load the filtered songs data
-filtered_data_path = "data/collab_filtered_data.csv"
-filtered_data = pd.read_csv(filtered_data_path)
+filtered_data_path = DATA_DIR / "collab_filtered_data.csv"
+filtered_data = _read_csv_rel(filtered_data_path)
 
 # load the interaction matrix
-interaction_matrix_path = "data/interaction_matrix.npz"
-interaction_matrix = load_npz(interaction_matrix_path)
+interaction_matrix_path = DATA_DIR / "interaction_matrix.npz"
+interaction_matrix = _load_npz_rel(interaction_matrix_path)
 
 # load the transformed hybrid data
-transformed_hybrid_data_path = "data/transformed_hybrid_data.npz"
-transformed_hybrid_data = load_npz(transformed_hybrid_data_path)
+transformed_hybrid_data_path = DATA_DIR / "transformed_hybrid_data.npz"
+transformed_hybrid_data = _load_npz_rel(transformed_hybrid_data_path)
 
 # Title
 st.title('Welcome to the Spotify Song Recommender!')
